@@ -1,0 +1,740 @@
+---
+title: "Supplementary R tutorial: Processing virtual fencing collar data"
+subtitle: "Two introductory workflows for time-binned and message-separated exports"
+author: "Schreiber et al."
+output:
+  html_document: 
+    toc: true
+    number_sections: true
+---
+
+# Purpose and scope
+
+This self-contained tutorial follows the manuscript's **Overview of Virtual Fence Data Processing Pipeline** (Fig. 3): (1) study design and data inspection; (2) spatial and temporal filtering, separate preparation of cue and position data, quality control, and temporal standardization; and (3) simple analyses. It covers the two formats illustrated in manuscript Table 1B and 1C. The code uses **synthetic data**, not actual animal observations, and runs without access to a manufacturer's export. All example thresholds are illustrative and require justification for real studies.
+
+The tutorial produces: a data-quality audit, cue counts and success ratios by animal/day, a position dataset for spatial analyses, and containment estimates. It does **not** fit an inferential model; the appropriate model (if any) depends on experimental design and research objectives.
+
+
+# 1. Setup and study design
+
+```{r setup, message=FALSE, warning=FALSE, results = 'hide'}
+packages_needed <- c("dplyr", "tidyr", "lubridate", "ggplot2", "sf", "tibble")
+lapply(packages_needed, library, character.only = TRUE)
+```
+
+## 1.1 Define study boundaries and key decisions
+
+For a real deployment, replace the example pasture with the **correct exported virtual-pasture polygon for each grazing period**. Use a local metric coordinate reference system (CRS) for distance calculations. Here, UTM zone 12N (EPSG:32612) is appropriate for our *hypothetical* Utah location. A 100-m buffer is used for **initial plausibility filtering**.
+
+```{r study-design}
+# Define important timepoints, including study start/end for temporal filtering
+study_start <- as.POSIXct("2026-06-01 00:00:00", tz = "UTC")
+study_end   <- as.POSIXct("2026-06-04 00:00:00", tz = "UTC")
+
+interval_min <- 15  # Example nominal position-update interval (depends on device specifics)
+speed_limit_m_s <- 0.3 # Example screening threshold (not a universal recommendation)
+accuracy_limit_m <- 30 # Example GPS horizontal-error threshold (not a universal recommendation)
+
+# Example rectangular virtual pasture in projected meters.
+xy <- matrix(c(450000, 4500000, 450600, 4500000,
+               450600, 4500600, 450000, 4500600,
+               450000, 4500000), ncol = 2, byrow = TRUE)
+
+pasture <- sf::st_sf(pasture_id = "P1", # This is the virtual pasture active on collars during the study
+                     geometry = sf::st_sfc(sf::st_polygon(list(xy)), crs = 32612))
+
+# Create a buffer (here ~100m) around used virtual pastures to define study area
+# This will be used for spatial filtering
+study_area <- sf::st_buffer(pasture, dist = 100)
+```
+
+**For real files:** Import a CSV with `read.csv("collar_export.csv")`; combine exports from multiple months using `dplyr::bind_rows()`; import boundaries with `sf::st_read("pastures.gpkg")`, `sf::st_read("pastures.kml")`, or `sf::st_read("pastures.shp")`; and ancillary data (experimental treatments, animal visual IDs, etc.).
+
+## 1.2 Simulated tracks and cue events
+
+The following generates simple movement paths for two collars. Both export formats (time-binned and message-separated) are constructed from the same underlying simulated positions, so their differences are easier to visualize. These are just **examples**, and not manufacturer specific. Again, all of this code is used to generate simulated collar data for use later in the tutorial. None of this code is necessarily applicable to your actual data export
+
+```{r simulate-points}
+set.seed(123)
+animals <- c("cow_01", "cow_02")
+time_bins <- seq(
+  study_start,
+  study_end - lubridate::minutes(interval_min),
+  by = "15 min")
+# x and y are projected coordinates (easting and northing in meters)
+# Each animal moves approximately every 15 minutes.
+# Horizontal errors are usually small (1-5 m).
+gps_positions <- tidyr::crossing(
+  animal_id = animals,
+  position_timestamp = time_bins) %>%
+  arrange(animal_id, position_timestamp) %>%
+  group_by(animal_id) %>%
+  mutate(
+    x = 450300 + cumsum(rnorm(n(), 0, 16)) +
+      if_else(animal_id == "cow_02", 70, 0),
+    y = 4500300 + cumsum(rnorm(n(), 0, 16)),
+    horizontal_error_m = runif(n(), 1, 5)) %>%
+  ungroup()
+# Add one deliberately erroneous GPS location.
+# This will later demonstrate speed-based screening.
+gps_positions <- gps_positions %>%
+  mutate(
+    x = if_else(
+      animal_id == "cow_01" &
+        position_timestamp == time_bins[40], x + 330, x))
+
+# Simulate the underlying cue messages ONCE so both export
+# formats contain the same events (audio and electrical).
+# The electrical messages below represent escalations of
+# preceding audio interactions, not additional audio cues.
+cues_raw <- tibble::tibble(
+  animal_id = c("cow_01", "cow_01", "cow_01", "cow_02",
+                "cow_02", "cow_01", "cow_02", "cow_02"),
+  message_timestamp = study_start + lubridate::minutes(
+    c(76, 78, 79, 350, 352, 1510, 1900, 1902)),
+  message_type = c("audio", "audio", "electrical", "audio",
+                   "electrical", "audio", "audio", "electrical"))
+
+# CREATE TIME-BINNED DATA
+# Each cue is attributed to the interval ending at the next
+# scheduled report (not the interval starting at the cue).
+cue_bins <- cues_raw %>%
+  mutate(timestamp = study_start + lubridate::minutes(
+    ceiling(as.numeric(difftime(message_timestamp, study_start,
+                                units = "mins")) / interval_min) * interval_min)) %>%
+  filter(timestamp < study_end) %>%
+  count(animal_id, timestamp, message_type, name = "n") %>%
+  tidyr::pivot_wider(names_from = message_type, values_from = n,
+                     values_fill = 0)
+
+# Use a reporting grid that starts after the first interval.
+# This ensures cues in (00:00, 00:15] belong to 00:15.
+time_binned <- gps_positions %>%
+  rename(timestamp = position_timestamp) %>%
+  group_by(animal_id) %>%
+  mutate(
+    x = if_else(row_number() == 20L, lag(x), x),
+    y = if_else(row_number() == 20L, lag(y), y)) %>%
+  ungroup() %>%
+  left_join(cue_bins, by = c("animal_id", "timestamp")) %>%
+  mutate(n_audio = tidyr::replace_na(audio, 0L),
+         n_electrical = tidyr::replace_na(electrical, 0L)) %>%
+  select(animal_id, timestamp, x, y, horizontal_error_m,
+         n_audio, n_electrical)
+
+# CREATE MESSAGE-SEPARATED DATA
+routine_messages <- gps_positions %>%
+  mutate(message_timestamp = position_timestamp,
+         message_type = "routine_update")
+
+# Cue messages report the last scheduled GPS acquisition.
+# This intentionally creates messages with stale positions.
+cue_messages <- cues_raw %>%
+  left_join(gps_positions,
+    by = dplyr::join_by(animal_id,
+                        message_timestamp >= position_timestamp),
+    relationship = "many-to-many") %>%
+  group_by(animal_id, message_timestamp, message_type) %>%
+  slice_max(position_timestamp, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+message_separated <- bind_rows(routine_messages, cue_messages) %>%
+  arrange(animal_id, message_timestamp) %>%
+  select(animal_id, message_timestamp, position_timestamp,
+         message_type, x, y, horizontal_error_m) %>%
+  mutate(position_age_min = as.numeric(difftime(
+    message_timestamp, position_timestamp, units = "mins")))
+
+```
+
+
+## 1.3 Compare the two data formats
+
+Now that we have simulated a few rows of data, let's see what that looks like in either message-separated and time-binned format. Remember that this does not apply if your data is position only. In that case, data will likely contain columns for animal_ID, latitude, longitude, and a timestamp, but no indication of cue delivery.
+
+The first table is time-binned format. This contains one row per animal per scheduled reporting interval. Audio and electrical cues are summarized as counts occurring during the corresponding reporting interval. When we simulated data, we introduced a repeated position to demonstrate that consecutive reports do not always contain a new fix. Next, we will cover how to look for evidence of these potential occurrences in your data. In time-binned data, repeated coordinates from the same animal in time-binned data *suggest*, but do not establish, reuse of a stored GPS fix.
+
+The second table is message-separated format. Each row represents an individual message, and separate message (when the message was generated) and position timestamps (when the fix was acquired) are given. These timestamps can differ when an existing GPS fix is reused for a subsequent message. Can you spot a re-used fix? Two or more consecutive and identical positions from the same animal with the same position timestamp but different message timestamps demonstrate a re-used fix. In this case, we can also quantify how old the reported GPS position is when each message is generated.
+
+```{r compare data types}
+
+head(time_binned, 10)
+
+head(message_separated, 10)
+
+message_separated %>%
+  count(message_type)
+
+```
+
+
+# 2. Initial Spatial and Temporal Filtering
+
+After initial inspection of data structure, we can filter data to the general spatial and temporal extent of our study. To do so, we must ensure the object is a spatial points object, and that datetime is correctly parsed or codified. If you have windows of time you need to exclude, such as animal handling periods, wait to do so until after other cleaning and pre-processing steps have been completed to avoid introducing artificial gaps in the data that could be otherwise treated as missing.
+
+```{r initial-filtering, warning=FALSE}
+# 1. Convert both datasets to spatial objects
+# x = easting (m); y = northing (m)
+time_binned_sf <- time_binned %>%
+  st_as_sf(
+    coords = c("x", "y"),
+    crs = 32612,
+    remove = FALSE)
+
+message_separated_sf <- message_separated %>%
+  st_as_sf(
+    coords = c("x", "y"),
+    crs = 32612,
+    remove = FALSE)
+
+# 2. Parse datetime columns
+# These are already POSIXct, but parsing is often necessary when importing CSV files.
+# Lubridate package is often useful for parsing datetime in various formats
+time_binned_sf <- time_binned_sf %>%
+  mutate(timestamp = as.POSIXct(timestamp, tz = "UTC"))
+
+message_separated_sf <- message_separated_sf %>%
+  mutate(
+    message_timestamp = as.POSIXct(message_timestamp, tz = "UTC"),
+    position_timestamp = as.POSIXct(position_timestamp, tz = "UTC"))
+
+# 4. Filter by study timeframe and spatial extent
+# st_filter() retains points intersecting the study area.
+time_binned_sf <- time_binned_sf %>%
+  filter(
+    timestamp >= study_start,
+    timestamp < study_end) %>%
+  st_filter(study_area)
+
+message_separated_sf <- message_separated_sf %>%
+  filter(
+    message_timestamp >= study_start,
+    message_timestamp < study_end) %>%
+  st_filter(study_area)
+
+# Plot and inspect pastures and study area polygons
+plot(sf::st_geometry(study_area), border = "grey60")
+plot(sf::st_geometry(pasture), add = TRUE, border = "darkgreen", lwd = 2)
+plot(message_separated_sf, add = TRUE)
+```
+
+
+# 3. Working with Cue Data
+
+Cue counts are analyzed separately from GPS positions. **Do not remove cue messages merely because their attached coordinates are reused or inaccurate**: a cue can be a valid event even if its position is stale. For time-binned data, the cue columns already contain counts. For message-separated data, each audio or electrical message is a separate event. These examples assume complete cue reporting; real transmission losses may make apparently empty periods *unknown*, rather than true zeros.
+
+```{r isolate-cues}
+# TIME-BINNED: keep the counts supplied in each reporting row.
+time_binned_cues <- time_binned_sf %>%
+  sf::st_drop_geometry() %>%
+  select(animal_id, timestamp, n_audio, n_electrical)
+
+# MESSAGE-SEPARATED: isolate individual cue events.
+message_separated_cues <- message_separated_sf %>%
+  sf::st_drop_geometry() %>%
+  filter(message_type %in% c("audio", "electrical")) %>%
+  select(animal_id, message_timestamp, message_type)
+
+head(message_separated_cues)
+```
+
+## 3.1 Summarize by animal and temporal units
+
+These analyses necessitate aggregating and summarizing cue data by units of time (hourly, daily, etc.). More details provided in the manuscript in subsection *Cue-Count-Based Analyses*. Time bins for which an animal receives no cues will contain a zero for that animal. The appropriate level of aggregation balances zero inflation risk with temporal resolution. Time-binned data will have a theoretical lower bound equal to the intended sampling interval, but message-separated data will not. However, using temporal resolution similar to the sampling interval will likely produce data where non-zero values are relatively rare. Overly course temporal resolution can reduce statistical power and preclude inference at finer temporal scales, but this will depend on the length of the study and the research questions. Some studes have used 1-hour time bins to capture finer resolution temporal trends, but daily aggregation is more common. For this tutorial, we will use **daily** bins for readability. For time-binned exports, **sum the count columns**. For message-separated exports, **count the cue messages**. The simulated electrical events are escalation events, so the number of audio interactions is the number of audio messages, not the sum of audio and electrical messages.
+
+```{r cue-aggregation}
+# TIME-BINNED: sum interval counts within animal and day.
+tb_cue_daily <- time_binned_cues %>%
+  mutate(day = as.Date(timestamp, tz = "UTC")) %>%
+# This uses calender day, but 'day of study' can be defined as number of 24-periods from study onset
+# Alternatively, 'hour of study' or some other relevant time period can be used to aggregate counts
+  group_by(animal_id, day) %>%
+  summarise(n_audio = sum(n_audio),
+            n_electrical = sum(n_electrical), .groups = "drop")
+
+# MESSAGE-SEPARATED: count individual event messages.
+ms_cue_daily <- message_separated_cues %>%
+  mutate(day = as.Date(message_timestamp, tz = "UTC")) %>%
+  count(animal_id, day, message_type, name = "n") %>%
+  tidyr::pivot_wider(names_from = message_type, values_from = n,
+                     values_fill = 0) %>%
+  rename(n_audio = audio, n_electrical = electrical)
+
+head(tb_cue_daily)
+head(ms_cue_daily) # This data frame does not include zeros for animal-days with no cues
+```
+
+## 3.2 Ensure zero retention
+
+An animal with no cues on a monitored day should have a **zero**, not a missing row. We construct all combinations of known study animals and study days. This is valid only for periods when collars were active and cue reporting was sufficiently complete. In actual studies, create the grid from an animal-specific deployment/coverage schedule rather than assuming every animal was observed every day.
+
+```{r cue-zero-retention}
+# All animals and monitored days in this simulated study.
+animal_days_grid <- tidyr::crossing(
+  animal_id = animals,
+  day = seq(as.Date(study_start), as.Date(study_end) - 1, by = "day"))
+
+# TIME-BINNED: explicitly retain days with no cues.
+tb_cue_daily <- animal_days_grid %>%
+  left_join(tb_cue_daily, by = c("animal_id", "day")) %>%
+  mutate(across(c(n_audio, n_electrical), ~ replace_na(.x, 0L)))
+
+# MESSAGE-SEPARATED: same grid, independently applied.
+ms_cue_daily <- animal_days_grid %>%
+  left_join(ms_cue_daily, by = c("animal_id", "day")) %>%
+  mutate(across(c(n_audio, n_electrical), ~ replace_na(.x, 0L)))
+
+# Check to see if the data frame now includes zeros
+head(ms_cue_daily)
+
+```
+
+## 3.3 Calculating cue rates and success ratio
+
+Animals’ responsiveness to auditory cues can be calculated as a ratio. Virtual fence user interfaces often report a simple auditory-electrical cue ratio, but electrical cues are a conditional subset of auditory cues, and this ratio has a lower bound of 0.5. Thus, responsiveness is better modeled as “success ratio” (i.e., audio only ratio) which describes the ratio of “successes” (auditory cues that do not escalate into an electrical cue) to total interactions with the virtual fence (total auditory cues). Because we chose daily aggregation, cue counts are in terms of **cues per animal per day**. Success ratio assumes each electrical cue represents an escalation of one auditory cue and that the export records both event types completely. A day (or whatever temporal unit of aggregation is used) with zero audio interactions has an **undefined** success ratio, not 100% success. Check each manufacturer's cue sequence and definitions before applying this formula.
+
+```{r cue-metrics}
+# TIME-BINNED: daily cue counts and success ratio.
+tb_cue_results <- tb_cue_daily %>%
+  mutate(success_ratio = if_else(n_audio > 0,
+    (n_audio - n_electrical) / n_audio, NA_real_))
+
+# MESSAGE-SEPARATED: the same metrics from event counts.
+ms_cue_results <- ms_cue_daily %>%
+  mutate(success_ratio = if_else(n_audio > 0,
+    (n_audio - n_electrical) / n_audio, NA_real_))
+
+print(tb_cue_results)
+print(ms_cue_results)
+```
+
+# 4. Creating a Position Dataset
+
+The position workflow differs from the cue workflow. Let's create a position dataset under anew name to reflect this divergence.
+
+```{r isolate-positions}
+# TIME-BINNED: rename to a position dataset to avoid overwriting original data
+tb_positions <- time_binned_sf
+
+# MESSAGE-SEPARATED: rename to a position dataset to avoid overwriting original data
+ms_positions <- message_separated_sf
+
+```
+
+## 4.1 Inspect temporal uniformity and search for position re-use
+
+Some devices will re-use a stored position in multiple consecutive messages (i.e., rows of data) without collecting a new fix. If data contains separate message and position timestamps (such as our message-separated dataset example), this is simple to discern by looking for messages (i.e., rows of data) with the same animal_ID, coordinates, and position timestamp. If datasets do not reveal separate position and message timestamps, look for consecutive messages (i.e., rows of data) with the same animal_ID and identical coordinates. These suggest but do not definitively prove position re-use. For illustration, we flag and remove consecutive exact coordinate repeats; this can also discard genuine stationary observations. The likelihood of this depends on both position specifcity (number of decimals the original lat/lon reported) and the magnitude of typical GPS fix error. Re-used positions should be removed from the dataset. Both before and after removing duplicates, use histograms to visually inspect the fixrate of the data (such as in Fig. 2 and Fig. 3 of the manuscript). See manuscript for more details on interpreting these histograms. Large gaps may indicate lost transmissions or reduced sampling, while very short intervals may reflect event-triggered reporting.
+
+### 4.1.1 Inspect message and position timestamp intervals
+
+For our time-binned data example, we can only calculate intervals between reported timestamps, because a distinct 'fix time' is not given. For message-separated data, we can separately examine intervals between messages and between the actual GPS position timestamps.
+
+```{r inspect-intervals}
+# TIME-BINNED: intervals between reported positions
+tb_intervals <- tb_positions %>%
+  sf::st_drop_geometry() %>%
+  arrange(animal_id, timestamp) %>%
+  group_by(animal_id) %>%
+  mutate(
+    dt_min = as.numeric(difftime(
+      timestamp, lag(timestamp), units = "mins"))) %>%
+  ungroup() %>%
+  mutate(interval_type = "Time-binned: report interval")
+
+# MESSAGE-SEPARATED: intervals between messages
+ms_message_intervals <- ms_positions %>%
+  sf::st_drop_geometry() %>%
+  arrange(animal_id, message_timestamp) %>%
+  group_by(animal_id) %>%
+  mutate(
+    dt_min = as.numeric(difftime(
+      message_timestamp, lag(message_timestamp),
+      units = "mins"))) %>%
+  ungroup() %>%
+  mutate(interval_type = "Message-sep.: message interval")
+
+# MESSAGE-SEPARATED: intervals between GPS timestamps
+ms_position_intervals <- ms_positions %>%
+  sf::st_drop_geometry() %>%
+  arrange(animal_id, position_timestamp, message_timestamp) %>%
+  group_by(animal_id) %>%
+  mutate(
+    dt_min = as.numeric(difftime(
+      position_timestamp, lag(position_timestamp), units = "mins"))) %>%
+  ungroup() %>%
+  mutate(interval_type = "Message-sep.: position interval")
+
+
+# Compare all three distributions
+bind_rows(
+  tb_intervals,
+  ms_message_intervals,
+  ms_position_intervals) %>%
+  filter(!is.na(dt_min)) %>%
+  ggplot(aes(x = dt_min)) +
+  geom_histogram(binwidth = 1, boundary = 0) +
+  facet_wrap(~ interval_type, scales = "free_y") +
+  labs(
+    x = "Time between consecutive observations (min)",
+    y = "Frequency") +
+  theme_minimal()
+```
+### 4.1.2 Identify duplicate positions
+
+Notice that the message-separated position histogram may contain numerous zero-minute intervals. These arise when multiple messages reference the same GPS acquisition timestamp, even though their message timestamps differ. We now quantitatively summarize observations that have identical coordinates to the immediately preceding observation from the same animal. For message-separated data, we additionally require identical GPS acquisition timestamps. This provides stronger evidence that the same position was reported more than once. Rather than simply counting duplicated rows, we will summarize the length of consecutive sequences of identical positions, including the original observation. For example, a sequence length of 3 means one original observation followed by two repeats.
+
+In message-separated data, this is also a good time to create multiple fixrate histograms based on each message type. Doing so will confirm if 100% of repeat positions are produced by a certain message type (e.g., cue messages). If so, these message types can simply be removed. We can also use this technique to test whether removing cue messages and leaving only routine collar position updates results in temporally uniform data (this will be important to know later on, depending on your analytical goals).
+
+```{r remove-repeats}
+# TIME-BINNED: identify consecutive repeated coordinates
+tb_positions <- tb_positions %>%
+  arrange(animal_id, timestamp) %>%
+  group_by(animal_id) %>%
+  mutate(
+    repeated_position = x == lag(x) & y == lag(y),
+    repeated_position = replace_na(repeated_position, FALSE),
+    sequence_id = cumsum(!repeated_position)) %>%
+  ungroup()
+
+# MESSAGE-SEPARATED: identify repeated coordinates AND timestamps
+ms_positions <- ms_positions %>%
+  arrange(animal_id, message_timestamp) %>%
+  group_by(animal_id) %>%
+  mutate(
+    repeated_position =
+      x == lag(x) &
+      y == lag(y) &
+      position_timestamp == lag(position_timestamp),
+    repeated_position = replace_na(repeated_position, FALSE),
+    sequence_id = cumsum(!repeated_position)) %>%
+  ungroup()
+
+# TIME-BINNED: count consecutive repeat sequence lengths
+tb_repeat_table <- tb_positions %>%
+  sf::st_drop_geometry() %>%
+  group_by(animal_id, sequence_id) %>%
+  summarise(sequence_length = n(), .groups = "drop") %>%
+  count(sequence_length, name = "n_sequences") %>%
+  arrange(sequence_length)
+
+print(tb_repeat_table)
+
+# MESSAGE-SEPARATED: count consecutive repeat sequence lengths
+ms_repeat_table <- ms_positions %>%
+  sf::st_drop_geometry() %>%
+  group_by(animal_id, sequence_id) %>%
+  summarise(sequence_length = n(), .groups = "drop") %>%
+  count(sequence_length, name = "n_sequences") %>%
+  arrange(sequence_length)
+
+print(ms_repeat_table)
+```
+
+### 4.1.3 Remove duplicate positions
+
+In message-separated data, if all repeat positions are produced by a certain message type (e.g., cue messages), those message types can simply be removed. Otherwise, we can retain the first observation in each sequence and remove subsequent repeats (regardless of message type); that is what we do in the current example. After removing duplicates, we can see that more positions are ultimately retained in the message-separated dataset, because when cue-associated positions occur within their own rows, and contain unique fixes, they effectively increase the temporal resolution of the data.
+
+```{r}
+# TIME-BINNED: remove consecutive identical coordinates
+tb_positions <- tb_positions %>%
+  filter(!repeated_position) %>%
+  select(-repeated_position, -sequence_id)
+
+# MESSAGE-SEPARATED: remove repeated GPS fixes
+ms_positions <- ms_positions %>%
+  filter(!repeated_position) %>%
+  select(-repeated_position, -sequence_id)
+
+# Report the number of retained positions
+tibble(
+  format = c("Time-binned", "Message-separated"),
+  n_retained_positions = c(nrow(tb_positions), nrow(ms_positions)))
+```
+
+### 4.1.4 Reinspect GPS fix intervals after removing repeats
+
+Finally, we recalculate intervals between the retained observations. This allows us to assess whether the distribution of GPS sampling intervals becomes more consistent after removing reused positions. At this stage, use only position timestamp fixrates, to visualize the uniformity of the underlying fix collection process. Whether or not irregular data is a problem that needs to be addressed will depend on downstream analyses.
+
+The resulting message-separated histogram demonstrates that, after removing duplicate positions and using position timestamps rather than message timestamps, the remaining data is uniform in time. This will not always be the case. See Fig. 2 in the manuscript for a real-data example.
+
+The resulting time-binned histogram demonstrates that, after removing duplicate positions, the remaining data is mostly uniform in time. A few exceptions exist where true fixrate is 30 min rather than 15 min. This reveals that a few 15-min bins are now "skipped" because they likely re-used old positions. This general pattern will not always be the case. See Fig. 3 in the manuscript for a real-data example. If fixrates appear to exactly align with uniform time bins (such as the simulated example in this tutorial), it is possible that the collar artificially assigns its positions to regularly sent messages, despite being collected irregularly.
+
+
+```{r}
+# TIME-BINNED: intervals between retained positions
+tb_intervals_clean <- tb_positions %>%
+  sf::st_drop_geometry() %>%
+  arrange(animal_id, timestamp) %>%
+  group_by(animal_id) %>%
+  mutate(
+    dt_min = as.numeric(difftime(
+      timestamp, lag(timestamp), units = "mins"))) %>%
+  ungroup() %>%
+  mutate(format = "Time-binned")
+
+
+# MESSAGE-SEPARATED: intervals between retained GPS fixes
+ms_intervals_clean <- ms_positions %>%
+  sf::st_drop_geometry() %>%
+  arrange(animal_id, position_timestamp) %>%
+  group_by(animal_id) %>%
+  mutate(
+    dt_min = as.numeric(difftime(
+      position_timestamp, lag(position_timestamp), units = "mins"))) %>%
+  ungroup() %>%
+  mutate(format = "Message-separated")
+
+
+# Plot cleaned interval distributions
+bind_rows(
+  tb_intervals_clean,
+  ms_intervals_clean) %>%
+  filter(!is.na(dt_min)) %>%
+  ggplot(aes(x = dt_min)) +
+  geom_histogram(binwidth = 1, boundary = 0) +
+  facet_wrap(~ format, scales = "free_y") +
+  labs(
+    x = "Time between retained GPS positions (min)",
+    y = "Frequency") +
+  theme_minimal()
+```
+
+## 4.2 Inspect and remove unrealistic steps/locations
+
+Calculate speed between consecutive fixes in a **projected CRS**. A large speed can indicate a faulty point, but it can also reflect a genuine movement or a long gap. To illustrate an isolated GPS spike, we flag a location only when **both** its incoming and outgoing step speeds exceed the chosen threshold. In this example, we use 0.2 m/s as a speed threshold to capture a simulated erroneous point. Because our simulated pasture is small, we have to use a speed threshold much lower than would normally be appropriate. Generally a threshold of 3-5 m/s is more approprite. This is a simplified screening rule, not a general-purpose telemetry error filter. Inspect flagged points and tracks before removal. This step would be the same for both dataset types, but we  include code for both, despite redundancy.
+
+```{r speed-screen, warning=FALSE}
+# We use a low m/s threshold to comply with our simulated points
+# Generally, a higher threshold (~3-5 m/s) is recommended, but should be biologically informed
+limit_m_s <- 0.2
+
+# TIME-BINNED: flag unlikely positions (i.e., "spikes").
+tb_positions <- tb_positions %>%
+  arrange(animal_id, timestamp) %>%
+  group_by(animal_id) %>%
+  mutate(
+    step_in_m = sqrt((x - lag(x))^2 + (y - lag(y))^2),
+    step_out_m = sqrt((lead(x) - x)^2 + (lead(y) - y)^2),
+    dt_in_s = as.numeric(difftime(timestamp, lag(timestamp), units = "secs")),
+    dt_out_s = as.numeric(difftime(lead(timestamp), timestamp, units = "secs")),
+    speed_in = if_else(dt_in_s > 0, step_in_m / dt_in_s, NA_real_),
+    speed_out = if_else(dt_out_s > 0, step_out_m / dt_out_s, NA_real_),
+    likely_spike = coalesce(speed_in > limit_m_s &
+                             speed_out > limit_m_s, FALSE)) %>%
+  ungroup()
+
+# MESSAGE-SEPARATED: flag unlikely positions using GPS acquisition timestamps.
+ms_positions <- ms_positions %>%
+  arrange(animal_id, position_timestamp) %>%
+  group_by(animal_id) %>%
+  mutate(
+    step_in_m = sqrt((x - lag(x))^2 + (y - lag(y))^2),
+    step_out_m = sqrt((lead(x) - x)^2 + (lead(y) - y)^2),
+    dt_in_s = as.numeric(difftime(position_timestamp, lag(position_timestamp), units = "secs")),
+    dt_out_s = as.numeric(difftime(lead(position_timestamp), position_timestamp, units = "secs")),
+    speed_in = if_else(dt_in_s > 0, step_in_m / dt_in_s, NA_real_),
+    speed_out = if_else(dt_out_s > 0, step_out_m / dt_out_s, NA_real_),
+    likely_spike = coalesce(speed_in > limit_m_s &
+                             speed_out > limit_m_s, FALSE)) %>%
+  ungroup()
+
+# Summarize the number and percentage of flagged positions.
+bind_rows(
+  tb_positions %>%
+    st_drop_geometry() %>%
+    mutate(format = "Time-binned"),
+  ms_positions %>%
+    st_drop_geometry() %>%
+    mutate(format = "Message-separated")) %>%
+  group_by(format) %>%
+  summarise(
+    n_positions = n(),
+    n_flagged = sum(likely_spike),
+    percent_flagged = 100 * n_flagged / n_positions,
+    .groups = "drop")
+
+# TIME-BINNED: remove flagged positions.
+tb_positions <- tb_positions %>%
+  filter(!likely_spike)
+
+# MESSAGE-SEPARATED: remove flagged positions.
+ms_positions <- ms_positions %>%
+  filter(!likely_spike)
+
+# Inspect cleaned positions against the virtual pasture
+# (message-separated example only).
+plot(sf::st_geometry(study_area), border = "grey60")
+plot(sf::st_geometry(pasture), add = TRUE,
+     border = "darkgreen", lwd = 2)
+plot(ms_positions, add = TRUE)
+# Notice the point that has been removed?
+```
+
+# 5. Position-Based Analyses
+
+For simplicity, we use **observed GPS fixes**, rather than estimating continuous movement paths. More advanced utilization-distribution (UD) methods, such as CTMM or Brownian bridge approaches, can be appropriate for irregularly sampled tracking data, but require additional assumptions, diagnostics, and specialist workflows.
+
+## 5.1 Filter positions with high error potential
+
+Apply any accuracy thresholds **after examining their distributions**. Here horizontal accuracy is an estimated distance in meters, not HDOP. These simulated values are mostly 1–5 m, so the illustrative 30-m threshold removes few or no points. In actual deployments, quality filtering can be spatially biased if accuracy or acquisition frequency changes near VF boundaries.
+
+```{r accuracy-screen}
+# TIME-BINNED: inspect reported horizontal error.
+summary(tb_positions$horizontal_error_m)
+tb_positions <- tb_positions %>%
+  filter(!is.na(horizontal_error_m),
+         horizontal_error_m <= accuracy_limit_m)
+
+# MESSAGE-SEPARATED: apply the same illustrative rule.
+summary(ms_positions$horizontal_error_m)
+ms_positions <- ms_positions %>%
+  filter(!is.na(horizontal_error_m),
+         horizontal_error_m <= accuracy_limit_m)
+
+# For real data, also compare the locations and proportion
+# of rejected fixes against VF boundaries and landscape.
+```
+
+## 5.2 Ensure data are temporally uniform
+
+Recheck fix intervals **after cleaning**. Removing a point creates a gap. We demonstrate a simple **15-minute bin selection**: retain at most one observed fix per animal per bin, without interpolating or inventing locations. This is not the same as guaranteeing an observation in every bin. For data that are strongly irregular, investigate the sampling mechanism and consider alternative methods rather than treating an incomplete grid as uniform.
+
+```{r temporal-standardization}
+# Helper: select one observed fix closest to each grid anchor.
+# Here anchors are based on study_start and the nominal interval.
+select_one_per_bin <- function(positions) {
+  positions %>%
+    mutate(
+      elapsed_min = as.numeric(difftime(fix_time, study_start,
+                                        units = "mins")),
+      bin_index = floor(elapsed_min / interval_min),
+      bin_start = study_start + lubridate::minutes(bin_index * interval_min),
+      offset_min = elapsed_min - bin_index * interval_min) %>%
+    group_by(animal_id, bin_index) %>%
+    slice_min(offset_min, n = 1, with_ties = FALSE) %>%
+    ungroup()
+}
+
+# TIME-BINNED: one observed position per 15-minute bin.
+tb_positions_15m <- select_one_per_bin(tb_positions)
+
+# MESSAGE-SEPARATED: one observed position per 15-minute bin.
+ms_positions_15m <- select_one_per_bin(ms_positions)
+
+# Count bins with retained fixes; a missing bin remains missing.
+tibble::tibble(
+  format = c("Time-binned", "Message-separated"),
+  n_fixes = c(nrow(tb_positions_15m), nrow(ms_positions_15m)))
+
+# Inspect retained intervals (do not assume exact regularity).
+tb_positions_15m %>% sf::st_drop_geometry() %>%
+  arrange(animal_id, fix_time) %>% group_by(animal_id) %>%
+  mutate(dt_min = as.numeric(difftime(fix_time, lag(fix_time),
+                                      units = "mins"))) %>%
+  summarise(min_interval = min(dt_min, na.rm = TRUE),
+            max_interval = max(dt_min, na.rm = TRUE), .groups = "drop")
+```
+
+## 5.3 Virtual fence analyses
+
+For spatial analyses, reference each fix against the **virtual pasture active at that time**. Our example has one pasture throughout the study. In real rotational deployments, join positions to a timestamped pasture history before spatial calculations. Use the point dataset with comparable sampling effort across animals and periods.
+
+### 5.3.1 Virtual fence effectiveness (containment)
+
+Containment is the fraction of **observed, retained fixes** inside the designated pasture, not necessarily the exact fraction of elapsed time inside. Here we include boundary points as inside using `st_intersects()`. We aggregate by animal and day and preserve days with zero *outside* points. **Do not replace a day with no GPS observations by zero containment**; its containment is unknown.
+
+```{r containment}
+# TIME-BINNED: spatially classify retained points.
+tb_containment_points <- tb_positions_15m %>%
+  mutate(inside = lengths(sf::st_intersects(geometry, pasture)) > 0,
+         day = as.Date(fix_time, tz = "UTC"))
+
+# MESSAGE-SEPARATED: classify routine acquired fixes.
+ms_containment_points <- ms_positions_15m %>%
+  mutate(inside = lengths(sf::st_intersects(geometry, pasture)) > 0,
+         day = as.Date(fix_time, tz = "UTC"))
+
+# TIME-BINNED: daily number and proportion of inside fixes.
+tb_containment_daily <- tb_containment_points %>%
+  sf::st_drop_geometry() %>%
+  group_by(animal_id, day) %>%
+  summarise(n_inside = sum(inside), n_outside = sum(!inside),
+            n_fixes = n(), containment = mean(inside), .groups = "drop")
+
+# MESSAGE-SEPARATED: same daily response.
+ms_containment_daily <- ms_containment_points %>%
+  sf::st_drop_geometry() %>%
+  group_by(animal_id, day) %>%
+  summarise(n_inside = sum(inside), n_outside = sum(!inside),
+            n_fixes = n(), containment = mean(inside), .groups = "drop")
+
+print(tb_containment_daily)
+print(ms_containment_daily)
+```
+
+### 5.3.2 Proximity to the virtual fence
+
+Calculate distance from each observed fix to the **pasture boundary** (not to the entire pasture polygon). Here we classify a point as boundary-proximal when it is **inside** the pasture and no more than 10 m from the boundary. The 10-m threshold is illustrative and should be evaluated relative to GPS uncertainty, collar cue-zone definitions, and study goals.
+
+```{r boundary-proximity}
+# Convert the polygon boundary to a line geometry.
+vf_boundary <- sf::st_boundary(sf::st_geometry(pasture))
+
+# TIME-BINNED: distance to virtual boundary in meters.
+tb_boundary_points <- tb_containment_points %>%
+  mutate(distance_to_vf_m = as.numeric(sf::st_distance(geometry,
+                                                      vf_boundary)[, 1]),
+         near_vf = inside & distance_to_vf_m <= 10)
+
+# MESSAGE-SEPARATED: identical spatial calculation.
+ms_boundary_points <- ms_containment_points %>%
+  mutate(distance_to_vf_m = as.numeric(sf::st_distance(geometry,
+                                                      vf_boundary)[, 1]),
+         near_vf = inside & distance_to_vf_m <= 10)
+
+# TIME-BINNED: fraction of retained fixes near the boundary.
+tb_boundary_daily <- tb_boundary_points %>%
+  sf::st_drop_geometry() %>%
+  group_by(animal_id, day) %>%
+  summarise(n_near = sum(near_vf), n_fixes = n(),
+            proportion_near = mean(near_vf), .groups = "drop")
+
+# MESSAGE-SEPARATED: same metric.
+ms_boundary_daily <- ms_boundary_points %>%
+  sf::st_drop_geometry() %>%
+  group_by(animal_id, day) %>%
+  summarise(n_near = sum(near_vf), n_fixes = n(),
+            proportion_near = mean(near_vf), .groups = "drop")
+
+print(tb_boundary_daily)
+print(ms_boundary_daily)
+```
+
+## 5.4 Exploring other analyses
+
+The manuscript also describes other responses that can be derived from collar data. These require further processing, additional assumptions, or covariates, and are **not implemented** in this introductory tutorial:
+
+- **Movement:** step length, travel distance per unit time, velocity, turning angle, and path tortuosity. Gaps and irregular fix intervals require particular attention.
+- **Distribution:** point-density maps, distribution evenness, utilization distributions (UDs), and behavior-specific space use when validated activity classifications are available.
+- **Habitat selection:** resource selection functions (RSFs), step selection functions (SSFs), and integrated SSFs (iSSFs), including appropriately defined available habitat or alternative steps.
+- **Virtual fence learning:** time to enter a newly accessible area after a boundary shift, and changes in cue frequency or success ratio over time.
+- **Social association:** pairwise distances or group cohesion, requiring synchronized fixes across animals and adequate concurrent collar coverage.
+
+All of these analyses depend on whether observations represent **new acquisitions**, reused stored locations, or model-estimated positions. GPS occurrence alone does not establish grazing behavior.
+
+
+# 6. Adaptation checklist and transparency
+
+Before applying the code to a real dataset, document the following in a methods supplement or data dictionary:
+
+1.  Device manufacturer, collar/firmware version, nominal sampling schedule, and whether reporting and acquisition timestamps differ.
+2.  Which message types can contain a **new** GPS fix, which reuse stored coordinates, and how cue escalation is represented.
+3.  Study dates, animal deployment/handling exclusions, active virtual-pasture versions, CRS, and spatial-filter buffer.
+4.  Raw and retained counts at every filtering step, including missing/duplicate fixes, temporal gaps, error flags, and excluded points.
+5.  Accuracy thresholds, biologically plausible speed limits, repeated-coordinate handling, and sensitivity analyses.
+6.  Resampling grid origin, interval, tolerance, whether any gaps remain, and whether positions were observed or model-estimated.
+7.  Cue aggregation unit, denominator, definition of audio success, and which zero-cue intervals are truly observed.
+8.  Whether position analyses use routine fixes only, all unique acquired fixes, or another defensible subset; and how containment is defined relative to cue zones.
+9.  Whether positional or behavioral sampling may depend on proximity to a virtual fence, inactivity, network coverage, or GPS quality.
+10. Data-access limitations, unavailable proprietary metadata, and reproducibility constraints.
+
