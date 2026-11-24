@@ -572,7 +572,9 @@ plot(ms_positions, add = TRUE)
 
 # 5. Position-Based Analyses
 
-For simplicity, we use **observed GPS fixes**, rather than estimating continuous movement paths. More advanced utilization-distribution (UD) methods, such as CTMM or Brownian bridge approaches, can be appropriate for irregularly sampled tracking data, but require additional assumptions, diagnostics, and specialist workflows.
+The next steps will depend on your analytical goals. If you intend to conduct analyses compatible with or related to modeled utilization-distributions (UD's), then you can proceed to contruct a UD. Popular methods include a dynamic brownian bride (dBBMM), which is available through the `move` package. Alternatively, continuous time movement models are available in the ctmm package. In the manuscript we demonstrate both a UD from both `move::brownian.bridge.dyn()` and `ctmm::occurence()` (Fig. 1 and Fig. 5). We will not further demonstrate the use of these methods within this tutorial. Both a dBBMM and a CTMM can accommodate data that is relatively irregular in time, and can incorporate GPS error values, meaning further pre-processing may not be necessary. However, significant temporal irregularity and extreme error estimates can sometimes still present issues when creating these movement models. Online resources for these packages are abundant.
+
+For conventional point- and step-based movement/distribution analyses, it is recommended to filter out points with high error potential. Some point- and step-based analyses can accommodate slight to moderate temporal irregularity. However, it is still recommended to mitigate irregularity, because it often represented biased underlying sampling process in VF collars, such as more frequent fixrate near virtual boundaries, or less frequent fixrate in parts of the pasture with poor connectivity. 
 
 ## 5.1 Filter positions with high error potential
 
