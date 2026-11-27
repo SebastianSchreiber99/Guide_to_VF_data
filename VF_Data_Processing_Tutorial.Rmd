@@ -31,9 +31,7 @@ For a real deployment, replace the example pasture with the **correct exported v
 study_start <- as.POSIXct("2026-06-01 00:00:00", tz = "UTC")
 study_end   <- as.POSIXct("2026-06-04 00:00:00", tz = "UTC")
 
-interval_min <- 15  # Example nominal position-update interval (depends on device specifics)
-speed_limit_m_s <- 0.3 # Example screening threshold (not a universal recommendation)
-accuracy_limit_m <- 30 # Example GPS horizontal-error threshold (not a universal recommendation)
+interval_min <- 15  # Let's assume our device has a default routine collar update rate of 15 min
 
 # Example rectangular virtual pasture in projected meters.
 xy <- matrix(c(450000, 4500000, 450600, 4500000,
@@ -310,7 +308,7 @@ print(ms_cue_results)
 
 # 4. Creating a Position Dataset
 
-The position workflow differs from the cue workflow. Let's create a position dataset under anew name to reflect this divergence.
+The position workflow differs from the cue workflow. Let's create a position dataset under a new name to reflect this divergence.
 
 ```{r isolate-positions}
 # TIME-BINNED: rename to a position dataset to avoid overwriting original data
@@ -455,7 +453,7 @@ tibble(
 
 Finally, we recalculate intervals between the retained observations. This allows us to assess whether the distribution of GPS sampling intervals becomes more consistent after removing reused positions. At this stage, use only position timestamp fixrates, to visualize the uniformity of the underlying fix collection process. Whether or not irregular data is a problem that needs to be addressed will depend on downstream analyses.
 
-The resulting message-separated histogram demonstrates that, after removing duplicate positions and using position timestamps rather than message timestamps, the remaining data is uniform in time. This will not always be the case. See Fig. 2 in the manuscript for a real-data example.
+The resulting message-separated histogram demonstrates that after removing duplicate positions and using position timestamps rather than message timestamps, the remaining data is uniform in time. This will not always be the case. See Fig. 2 in the manuscript for a real-data example.
 
 The resulting time-binned histogram demonstrates that, after removing duplicate positions, the remaining data is mostly uniform in time. A few exceptions exist where true fixrate is 30 min rather than 15 min. This reveals that a few 15-min bins are now "skipped" because they likely re-used old positions. This general pattern will not always be the case. See Fig. 3 in the manuscript for a real-data example. If fixrates appear to exactly align with uniform time bins (such as the simulated example in this tutorial), it is possible that the collar artificially assigns its positions to regularly sent messages, despite being collected irregularly.
 
@@ -572,143 +570,108 @@ plot(ms_positions, add = TRUE)
 
 # 5. Position-Based Analyses
 
-The next steps will depend on your analytical goals. If you intend to conduct analyses compatible with or related to modeled utilization-distributions (UD's), then you can proceed to contruct a UD. Popular methods include a dynamic brownian bride (dBBMM), which is available through the `move` package. Alternatively, continuous time movement models are available in the ctmm package. In the manuscript we demonstrate both a UD from both `move::brownian.bridge.dyn()` and `ctmm::occurence()` (Fig. 1 and Fig. 5). We will not further demonstrate the use of these methods within this tutorial. Both a dBBMM and a CTMM can accommodate data that is relatively irregular in time, and can incorporate GPS error values, meaning further pre-processing may not be necessary. However, significant temporal irregularity and extreme error estimates can sometimes still present issues when creating these movement models. Online resources for these packages are abundant.
+The next steps will depend on your analytical goals. If you intend to conduct analyses compatible with or related to modeled utilization-distributions (UD's), then you can proceed to construct a UD. Popular methods include a dynamic brownian bridge (dBBMM), which is available through the `move` package. Alternatively, continuous time movement models are available in the ctmm package. In the manuscript we demonstrate both a UD from both `move::brownian.bridge.dyn()` and `ctmm::occurence()` (Fig. 1 and Fig. 5). We will not further demonstrate the use of these methods within this tutorial. Both a dBBMM and a CTMM can accommodate data that is relatively irregular in time, and can incorporate GPS error values, meaning further pre-processing may not be necessary. However, significant temporal irregularity and extreme error estimates can sometimes still present issues when creating these movement models. Online resources for these packages are abundant.
 
 For conventional point- and step-based movement/distribution analyses, it is recommended to filter out points with high error potential. Some point- and step-based analyses can accommodate slight to moderate temporal irregularity. However, it is still recommended to mitigate irregularity, because it often represented biased underlying sampling process in VF collars, such as more frequent fixrate near virtual boundaries, or less frequent fixrate in parts of the pasture with poor connectivity. 
 
 ## 5.1 Filter positions with high error potential
 
-Apply any accuracy thresholds **after examining their distributions**. Here horizontal accuracy is an estimated distance in meters, not HDOP. These simulated values are mostly 1–5 m, so the illustrative 30-m threshold removes few or no points. In actual deployments, quality filtering can be spatially biased if accuracy or acquisition frequency changes near VF boundaries.
+Apply appropriate accuracy thresholds, which should be done after examining their distributions. Here we use horizontal accuracy as an example uncertainty metric in meters, not the same as HDOP. These simulated values are mostly 1–5 m, so the illustrative 10-m threshold removes few or no points. In actual deployments, quality filtering can be spatially biased if accuracy changes near VF boundaries. See manuscript (Fig. 5) for more information.
 
 ```{r accuracy-screen}
-# TIME-BINNED: inspect reported horizontal error.
+accuracy_limit_m <- 10 # Example GPS horizontal-error threshold (not a universal recommendation)
+
 summary(tb_positions$horizontal_error_m)
-tb_positions <- tb_positions %>%
-  filter(!is.na(horizontal_error_m),
-         horizontal_error_m <= accuracy_limit_m)
+
+# TIME-BINNED: inspect reported horizontal error.
+tb_positions_clean <- tb_positions %>%
+  filter(horizontal_error_m <= accuracy_limit_m)
 
 # MESSAGE-SEPARATED: apply the same illustrative rule.
-summary(ms_positions$horizontal_error_m)
-ms_positions <- ms_positions %>%
-  filter(!is.na(horizontal_error_m),
-         horizontal_error_m <= accuracy_limit_m)
+ms_positions_clean <- ms_positions %>%
+  filter(horizontal_error_m <= accuracy_limit_m)
 
 # For real data, also compare the locations and proportion
 # of rejected fixes against VF boundaries and landscape.
 ```
 
-## 5.2 Ensure data are temporally uniform
+## 5.2 Ensure data are temporally uniform?
 
-Recheck fix intervals **after cleaning**. Removing a point creates a gap. We demonstrate a simple **15-minute bin selection**: retain at most one observed fix per animal per bin, without interpolating or inventing locations. This is not the same as guaranteeing an observation in every bin. For data that are strongly irregular, investigate the sampling mechanism and consider alternative methods rather than treating an incomplete grid as uniform.
+Recheck fix intervals **after cleaning**. If fix intervals appear irregular, compare fix intervals of dataset before and after quality filtering, but after removal of likely duplicates. It is important to do so with pre- and post-filtered datasets, because irregularity can result from either aggressive cleaning/filtering, or from an irregular fix generating process. Ultimately, an attempt to mitigate temporal irregularity should be guided by both intended analyses, temporal resolution of those analyses, and the severity of irregularity. Genuinely reported GPS fix timestamps, especially those with second-level resolution, can be expected to have some degree of irregularity. Rare and minor irregularity is typically not problematic. Moderate to large datasets in which GPS fixes have perfect, second-level uniformity, are suspicious, and may indicate that position timestamps were artificially standardized after collection.
+
+Irregular fix generating processes could result from a few underlying differences, and resemble one of three fixrate distributions, each with distinct analytical implications. In the first scenario, the fixrate distribution will likelypeak at the programmed/default fixrate, and have a left tail but no right tail, indicating fixes sometimes occur more frequently than expected but never (or very rarely) less frequently. As we alluded to in section *4.1.4*, this likely occurs because more frequent fixes result from VF interactions (i.e., cue-associated positions). If so, removing cue messages while leaving routine position updates, can regularize data (only applicable for message-separated datasets). If isolating and removing cue-associated positions is not possible, such as with time-binned data, or doing so does not fix the irregularity, another condition such as animal activity level may influence fixrate. In this case, re-sampling along a uniform time interval (similar to the default fixrate) is the recommended approach.
+
+In the second scenario, the fixrate distribution will peak at the programmed/default fixrate, and have a right tail but no left tail, indicating fixes sometimes occur less frequently than expected but never (or very rarely) more frequently. As we show in Fig. 1 of the manuscript, this could occur due to connectivity or data transmission issues. It could also occur if devices reduce fixrates for inactive animals or animals not near the VF. In this case, removing data, either through omitting cue messages or re-sampling, will not improve gaps in the data.
+
+In the third scenario, the fixrate distribution will likely peak at the programmed/default fixrate, and have both right and left tails, indicating fixes sometimes occur less frequently and sometimes more frequently than expected. This is demonstrated in Fig. 3 of the manuscript. This distribution likely results from a combination of the factors described in the preceding scenarios. As per the first scenario, removal of cue-associated positions (for message-separated data) or re-sampling are recommended to reduce the left tail. However, these approaches will not reduce the right tail.
+
+If these approaches for mitigating irregularity are not effective, and significant irregularity persists to a degree incompatible with the intended analysis, it may be possible to construct a modeled UD using dBBMM or CTMM, and use the UD directly, or sample points from the UD for use in another analysis. In this case, beware that these are modeled not observed points. Regardless, in this tutorial, we demonstrate how to re-sample positions along a uniform time interval (with the message-separated dataset only, as is more common). However, this approach may not always be appropriate or helpful. See manuscript for more details on mitigating irregularity.
 
 ```{r temporal-standardization}
-# Helper: select one observed fix closest to each grid anchor.
-# Here anchors are based on study_start and the nominal interval.
-select_one_per_bin <- function(positions) {
-  positions %>%
+interval_min <- 15  # Example re-sampling interval (see manuscript for details on selecting re-sampling interval)
+
+# This function selects one observed fix closest to each interval bounds
+# Interval bounds are based on study_start and the nominal interval.
+ms_positions_15m <- ms_positions_clean %>%
     mutate(
-      elapsed_min = as.numeric(difftime(fix_time, study_start,
-                                        units = "mins")),
+      elapsed_min = as.numeric(difftime(position_timestamp, study_start, units = "mins")),
       bin_index = floor(elapsed_min / interval_min),
-      bin_start = study_start + lubridate::minutes(bin_index * interval_min),
-      offset_min = elapsed_min - bin_index * interval_min) %>%
+      offset_min = elapsed_min - bin_index * interval_min) %>% # This is to select the fix closest to interval bound
     group_by(animal_id, bin_index) %>%
     slice_min(offset_min, n = 1, with_ties = FALSE) %>%
     ungroup()
-}
-
-# TIME-BINNED: one observed position per 15-minute bin.
-tb_positions_15m <- select_one_per_bin(tb_positions)
-
-# MESSAGE-SEPARATED: one observed position per 15-minute bin.
-ms_positions_15m <- select_one_per_bin(ms_positions)
 
 # Count bins with retained fixes; a missing bin remains missing.
-tibble::tibble(
-  format = c("Time-binned", "Message-separated"),
-  n_fixes = c(nrow(tb_positions_15m), nrow(ms_positions_15m)))
-
-# Inspect retained intervals (do not assume exact regularity).
-tb_positions_15m %>% sf::st_drop_geometry() %>%
-  arrange(animal_id, fix_time) %>% group_by(animal_id) %>%
-  mutate(dt_min = as.numeric(difftime(fix_time, lag(fix_time),
-                                      units = "mins"))) %>%
-  summarise(min_interval = min(dt_min, na.rm = TRUE),
-            max_interval = max(dt_min, na.rm = TRUE), .groups = "drop")
+tibble::tibble(n_fixes = nrow(ms_positions_15m))
 ```
 
 ## 5.3 Virtual fence analyses
 
-For spatial analyses, reference each fix against the **virtual pasture active at that time**. Our example has one pasture throughout the study. In real rotational deployments, join positions to a timestamped pasture history before spatial calculations. Use the point dataset with comparable sampling effort across animals and periods.
+For spatial analyses, reference each fix against the **virtual pasture active at that time**. Our example has one pasture throughout the study. Some VF systems do not allow for exporting of virtual pasture polygons, in which case manual geo-referencing may be necessary. Other manufactures include a .csv of all used virtual pastures along with primary data export. These will need to be converted to spatial polygons. After this, join positions to a timestamped pasture history before spatial calculations. 
+
 
 ### 5.3.1 Virtual fence effectiveness (containment)
 
-Containment is the fraction of **observed, retained fixes** inside the designated pasture, not necessarily the exact fraction of elapsed time inside. Here we include boundary points as inside using `st_intersects()`. We aggregate by animal and day and preserve days with zero *outside* points. **Do not replace a day with no GPS observations by zero containment**; its containment is unknown.
+Containment is the proportion of **observed, retained fixes** inside the designated pasture, not necessarily the exact fraction of elapsed time inside, but with proper data cleaning, filtering, and pre-processing, it should be similar. Here we include boundary points as inside using `st_intersects()`. We aggregate by animal and day and preserve days with zero *outside* points. **Do not define a day with no GPS observations as having zero containment**; its containment is unknown. We use the re-sampled message-separated dataset only, but these steps will be the same for both.
 
 ```{r containment}
-# TIME-BINNED: spatially classify retained points.
-tb_containment_points <- tb_positions_15m %>%
-  mutate(inside = lengths(sf::st_intersects(geometry, pasture)) > 0,
-         day = as.Date(fix_time, tz = "UTC"))
-
-# MESSAGE-SEPARATED: classify routine acquired fixes.
+# Calculate whether points are in or out
 ms_containment_points <- ms_positions_15m %>%
   mutate(inside = lengths(sf::st_intersects(geometry, pasture)) > 0,
-         day = as.Date(fix_time, tz = "UTC"))
+         day = as.Date(position_timestamp, tz = "UTC"))
 
-# TIME-BINNED: daily number and proportion of inside fixes.
-tb_containment_daily <- tb_containment_points %>%
-  sf::st_drop_geometry() %>%
-  group_by(animal_id, day) %>%
-  summarise(n_inside = sum(inside), n_outside = sum(!inside),
-            n_fixes = n(), containment = mean(inside), .groups = "drop")
-
-# MESSAGE-SEPARATED: same daily response.
+# Aggregate daily
 ms_containment_daily <- ms_containment_points %>%
   sf::st_drop_geometry() %>%
   group_by(animal_id, day) %>%
   summarise(n_inside = sum(inside), n_outside = sum(!inside),
             n_fixes = n(), containment = mean(inside), .groups = "drop")
 
-print(tb_containment_daily)
+# Inspect results
 print(ms_containment_daily)
 ```
 
 ### 5.3.2 Proximity to the virtual fence
 
-Calculate distance from each observed fix to the **pasture boundary** (not to the entire pasture polygon). Here we classify a point as boundary-proximal when it is **inside** the pasture and no more than 10 m from the boundary. The 10-m threshold is illustrative and should be evaluated relative to GPS uncertainty, collar cue-zone definitions, and study goals.
+Calculate distance from each observed fix to the pasture boundary. Here, we classify a point as boundary-proximal when it is **inside** the pasture and no more than 5 m from the boundary. The 5-m threshold is illustrative and should be evaluated relative to GPS uncertainty, collar cue-zone definitions, and study goals. This reflects  proportion of **observed, retained fixes** near the VF, not necessarily the exact fraction of elapsed time proximal to the VF, but with proper data cleaning, filtering, and pre-processing, it should be similar. We aggregate by animal and day. We use the re-sampled message-separated dataset only, but these steps will be the same for both. A similar and potentially more robust analysis can be conducted while accounting for other covariates by performing an RSF, and defining the VF-proximal zone as a binary covariate.
+
 
 ```{r boundary-proximity}
 # Convert the polygon boundary to a line geometry.
 vf_boundary <- sf::st_boundary(sf::st_geometry(pasture))
 
-# TIME-BINNED: distance to virtual boundary in meters.
-tb_boundary_points <- tb_containment_points %>%
-  mutate(distance_to_vf_m = as.numeric(sf::st_distance(geometry,
-                                                      vf_boundary)[, 1]),
-         near_vf = inside & distance_to_vf_m <= 10)
+# Perform spatial calculation.
+ms_boundary_points <- ms_containment_points %>% # we use containment points as some steps are shared with that analysis
+  mutate(distance_to_vf_m = as.numeric(sf::st_distance(geometry, vf_boundary)[, 1]),
+         near_vf = inside & distance_to_vf_m <= 5)
 
-# MESSAGE-SEPARATED: identical spatial calculation.
-ms_boundary_points <- ms_containment_points %>%
-  mutate(distance_to_vf_m = as.numeric(sf::st_distance(geometry,
-                                                      vf_boundary)[, 1]),
-         near_vf = inside & distance_to_vf_m <= 10)
-
-# TIME-BINNED: fraction of retained fixes near the boundary.
-tb_boundary_daily <- tb_boundary_points %>%
-  sf::st_drop_geometry() %>%
-  group_by(animal_id, day) %>%
-  summarise(n_near = sum(near_vf), n_fixes = n(),
-            proportion_near = mean(near_vf), .groups = "drop")
-
-# MESSAGE-SEPARATED: same metric.
+# Calculate fraction of retained fixes near the boundary.
 ms_boundary_daily <- ms_boundary_points %>%
   sf::st_drop_geometry() %>%
   group_by(animal_id, day) %>%
   summarise(n_near = sum(near_vf), n_fixes = n(),
             proportion_near = mean(near_vf), .groups = "drop")
 
-print(tb_boundary_daily)
 print(ms_boundary_daily)
 ```
 
@@ -720,23 +683,6 @@ The manuscript also describes other responses that can be derived from collar da
 - **Distribution:** point-density maps, distribution evenness, utilization distributions (UDs), and behavior-specific space use when validated activity classifications are available.
 - **Habitat selection:** resource selection functions (RSFs), step selection functions (SSFs), and integrated SSFs (iSSFs), including appropriately defined available habitat or alternative steps.
 - **Virtual fence learning:** time to enter a newly accessible area after a boundary shift, and changes in cue frequency or success ratio over time.
-- **Social association:** pairwise distances or group cohesion, requiring synchronized fixes across animals and adequate concurrent collar coverage.
+- **Social association:** herd-level mean pairwise distance, requiring synchronized fixes across animals and adequate concurrent collar coverage.
 
 All of these analyses depend on whether observations represent **new acquisitions**, reused stored locations, or model-estimated positions. GPS occurrence alone does not establish grazing behavior.
-
-
-# 6. Adaptation checklist and transparency
-
-Before applying the code to a real dataset, document the following in a methods supplement or data dictionary:
-
-1.  Device manufacturer, collar/firmware version, nominal sampling schedule, and whether reporting and acquisition timestamps differ.
-2.  Which message types can contain a **new** GPS fix, which reuse stored coordinates, and how cue escalation is represented.
-3.  Study dates, animal deployment/handling exclusions, active virtual-pasture versions, CRS, and spatial-filter buffer.
-4.  Raw and retained counts at every filtering step, including missing/duplicate fixes, temporal gaps, error flags, and excluded points.
-5.  Accuracy thresholds, biologically plausible speed limits, repeated-coordinate handling, and sensitivity analyses.
-6.  Resampling grid origin, interval, tolerance, whether any gaps remain, and whether positions were observed or model-estimated.
-7.  Cue aggregation unit, denominator, definition of audio success, and which zero-cue intervals are truly observed.
-8.  Whether position analyses use routine fixes only, all unique acquired fixes, or another defensible subset; and how containment is defined relative to cue zones.
-9.  Whether positional or behavioral sampling may depend on proximity to a virtual fence, inactivity, network coverage, or GPS quality.
-10. Data-access limitations, unavailable proprietary metadata, and reproducibility constraints.
-
